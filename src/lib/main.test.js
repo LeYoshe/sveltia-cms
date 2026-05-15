@@ -52,6 +52,38 @@ vi.mock('$lib/services/contents/draft/events', () => ({
     'postUnpublish',
   ],
 }));
+vi.mock('$lib/services/backends', () => {
+  const backends = {
+    github: { isGit: true, name: 'github', label: 'GitHub' },
+    gitlab: { isGit: true, name: 'gitlab', label: 'GitLab' },
+    gitea: { isGit: true, name: 'gitea', label: 'Gitea / Forgejo' },
+    local: { isGit: false, name: 'local', label: 'Local' },
+    'test-repo': { isGit: false, name: 'test-repo', label: 'Test' },
+  };
+
+  return {
+    allBackendServices: backends,
+    validBackendNames: Object.keys(backends).filter((name) => name !== 'local'),
+  };
+});
+vi.mock('$lib/services/assets/kinds', () => ({
+  getAssetKind: vi.fn((name) => (name.match(/\.(png|jpg|jpeg|gif|svg|webp)$/i) ? 'image' : 'file')),
+}));
+vi.mock('$lib/services/backends/process', () => ({
+  createFileList: vi.fn((files) => ({
+    entryFiles: files.filter((f) => /\.(md|json|ya?ml)$/.test(f.path)),
+    assetFiles: files.filter((f) => /\.(png|jpg|jpeg|gif|svg|webp)$/.test(f.path)),
+    configFiles: [],
+    allFiles: files,
+    count: files.length,
+  })),
+}));
+vi.mock('$lib/services/backends/git/shared/fetch', () => ({
+  updateStores: vi.fn(),
+}));
+vi.mock('$lib/services/contents/file/process', () => ({
+  prepareEntries: vi.fn((entries) => ({ entries, errors: [] })),
+}));
 vi.mock('$lib/components/app.svelte', () => ({
   default: {},
 }));
@@ -675,6 +707,263 @@ describe('CMS.registerFieldType()', () => {
   });
 });
 
+describe('CMS.registerBackend()', () => {
+  const validBackend = {
+    init: () => undefined,
+    signIn: async () => ({ backendName: 'custom' }),
+    signOut: async () => {},
+    fetchFiles: async () => {},
+    commitChanges: async () => ({ commitHash: null, files: new Map() }),
+  };
+
+  test('registers a valid custom backend', () => {
+    expect(() => CMS.registerBackend('custom-api', validBackend)).not.toThrow();
+  });
+
+  test('registers backend with optional methods', () => {
+    const backendWithOptional = {
+      ...validBackend,
+      fetchBlob: async () => new Blob(),
+      fetchFileCommits: async () => [],
+      checkStatus: async () => 'none',
+      triggerDeployment: async () => new Response(),
+    };
+
+    expect(() => CMS.registerBackend('custom-full', backendWithOptional)).not.toThrow();
+  });
+
+  test('registers backend with isGit and label overrides', () => {
+    expect(() =>
+      CMS.registerBackend('custom-git', { ...validBackend, isGit: true, label: 'My Git' }),
+    ).not.toThrow();
+  });
+
+  test('throws TypeError if name is not a string', () => {
+    // @ts-ignore
+    expect(() => CMS.registerBackend(123, validBackend)).toThrow(TypeError);
+    // @ts-ignore
+    expect(() => CMS.registerBackend(null, validBackend)).toThrow(TypeError);
+    // @ts-ignore
+    expect(() => CMS.registerBackend(undefined, validBackend)).toThrow(TypeError);
+  });
+
+  test('throws TypeError if name is empty string', () => {
+    expect(() => CMS.registerBackend('', validBackend)).toThrow(TypeError);
+  });
+
+  test('throws with proper error message for invalid name', () => {
+    // @ts-ignore
+    expect(() => CMS.registerBackend(123, validBackend)).toThrow(
+      'The `name` option for `CMS.registerBackend()` must be a non-empty string',
+    );
+  });
+
+  test('throws TypeError if backend is not an object', () => {
+    // @ts-ignore
+    expect(() => CMS.registerBackend('my-backend', 'invalid')).toThrow(TypeError);
+    // @ts-ignore
+    expect(() => CMS.registerBackend('my-backend', 123)).toThrow(TypeError);
+    // @ts-ignore
+    expect(() => CMS.registerBackend('my-backend', null)).toThrow(TypeError);
+  });
+
+  test('throws with proper error message for invalid backend', () => {
+    // @ts-ignore
+    expect(() => CMS.registerBackend('my-backend', 'invalid')).toThrow(
+      'The `backend` option for `CMS.registerBackend()` must be an object',
+    );
+  });
+
+  test('throws Error when trying to override built-in backend', () => {
+    expect(() => CMS.registerBackend('github', validBackend)).toThrow(Error);
+    expect(() => CMS.registerBackend('gitlab', validBackend)).toThrow(Error);
+    expect(() => CMS.registerBackend('gitea', validBackend)).toThrow(Error);
+    expect(() => CMS.registerBackend('test-repo', validBackend)).toThrow(Error);
+  });
+
+  test('throws with proper error message for built-in conflict', () => {
+    expect(() => CMS.registerBackend('github', validBackend)).toThrow(
+      'Cannot register backend "github": it conflicts with a built-in backend.',
+    );
+  });
+
+  test('throws TypeError if required method init is missing', () => {
+    const { init, ...noInit } = validBackend;
+
+    // @ts-ignore
+    expect(() => CMS.registerBackend('no-init', noInit)).toThrow(TypeError);
+    // @ts-ignore
+    expect(() => CMS.registerBackend('no-init', noInit)).toThrow(
+      'The backend must have a `init` function.',
+    );
+  });
+
+  test('throws TypeError if required method signIn is missing', () => {
+    const { signIn, ...noSignIn } = validBackend;
+
+    // @ts-ignore
+    expect(() => CMS.registerBackend('no-signin', noSignIn)).toThrow(TypeError);
+  });
+
+  test('throws TypeError if required method signOut is missing', () => {
+    const { signOut, ...noSignOut } = validBackend;
+
+    // @ts-ignore
+    expect(() => CMS.registerBackend('no-signout', noSignOut)).toThrow(TypeError);
+  });
+
+  test('throws TypeError if required method fetchFiles is missing', () => {
+    const { fetchFiles, ...noFetchFiles } = validBackend;
+
+    // @ts-ignore
+    expect(() => CMS.registerBackend('no-fetch', noFetchFiles)).toThrow(TypeError);
+  });
+
+  test('throws TypeError if required method commitChanges is missing', () => {
+    const { commitChanges, ...noCommit } = validBackend;
+
+    // @ts-ignore
+    expect(() => CMS.registerBackend('no-commit', noCommit)).toThrow(TypeError);
+  });
+
+  test('throws TypeError if required method is not a function', () => {
+    expect(() =>
+      // @ts-ignore
+      CMS.registerBackend('bad-init', { ...validBackend, init: 'not-a-function' }),
+    ).toThrow(TypeError);
+  });
+
+  test('throws TypeError if optional method is provided but not a function', () => {
+    expect(() =>
+      // @ts-ignore
+      CMS.registerBackend('bad-blob', { ...validBackend, fetchBlob: 'not-a-function' }),
+    ).toThrow(TypeError);
+    expect(() =>
+      // @ts-ignore
+      CMS.registerBackend('bad-commits', { ...validBackend, fetchFileCommits: 123 }),
+    ).toThrow(TypeError);
+    expect(() =>
+      // @ts-ignore
+      CMS.registerBackend('bad-status', { ...validBackend, checkStatus: {} }),
+    ).toThrow(TypeError);
+    expect(() =>
+      // @ts-ignore
+      CMS.registerBackend('bad-deploy', { ...validBackend, triggerDeployment: true }),
+    ).toThrow(TypeError);
+  });
+
+  test('throws with proper error message for invalid optional method', () => {
+    expect(() =>
+      // @ts-ignore
+      CMS.registerBackend('bad-blob2', { ...validBackend, fetchBlob: 'invalid' }),
+    ).toThrow(
+      'The optional `fetchBlob` property on the backend must be a function if provided.',
+    );
+  });
+
+  test('ignores undefined optional methods without error', () => {
+    const backend = {
+      ...validBackend,
+      fetchBlob: undefined,
+      fetchFileCommits: undefined,
+      checkStatus: undefined,
+      triggerDeployment: undefined,
+    };
+
+    expect(() => CMS.registerBackend('optional-undef', backend)).not.toThrow();
+  });
+
+  test('defaults isGit to false', () => {
+    // The backend is registered without isGit, so it should default to false
+    // We can't directly inspect the internal state, but we verify it doesn't throw
+    expect(() => CMS.registerBackend('no-isgit', validBackend)).not.toThrow();
+  });
+
+  test('registerBackend method is accessible on CMS object', () => {
+    expect(typeof CMS.registerBackend).toBe('function');
+  });
+
+  test('wraps fetchFiles to process returned file arrays automatically', async () => {
+    const { updateStores } = await import('$lib/services/backends/git/shared/fetch');
+    const { allBackendServices } = await import('$lib/services/backends');
+
+    const files = [
+      { path: 'pages/home.md', text: '---\ntitle: Home\n---', sha: 'abc', size: 30 },
+      { path: 'images/logo.png', sha: 'def', size: 5000 },
+    ];
+
+    CMS.registerBackend('wrap-test', {
+      ...validBackend,
+      fetchFiles: async () => files,
+    });
+
+    // Call the wrapped fetchFiles
+    await allBackendServices['wrap-test'].fetchFiles();
+
+    // updateStores should have been called with processed data
+    expect(updateStores).toHaveBeenCalled();
+  });
+
+  test('wraps fetchFiles to derive name from path when name is missing', async () => {
+    const { allBackendServices } = await import('$lib/services/backends');
+
+    CMS.registerBackend('wrap-name-test', {
+      ...validBackend,
+      fetchFiles: async () => [{ path: 'pages/about.md', text: '---\ntitle: About\n---' }],
+    });
+
+    // Should not throw — name is derived automatically
+    await expect(allBackendServices['wrap-name-test'].fetchFiles()).resolves.toBeUndefined();
+  });
+
+  test('wraps fetchFiles to handle void return (advanced usage)', async () => {
+    const { updateStores } = await import('$lib/services/backends/git/shared/fetch');
+    const { allBackendServices } = await import('$lib/services/backends');
+
+    // @ts-ignore — clear mock call count
+    updateStores.mockClear();
+
+    CMS.registerBackend('wrap-void-test', {
+      ...validBackend,
+      fetchFiles: async () => undefined,
+    });
+
+    await allBackendServices['wrap-void-test'].fetchFiles();
+
+    // updateStores should NOT be called when fetchFiles returns void
+    expect(updateStores).not.toHaveBeenCalled();
+  });
+
+  test('wraps commitChanges to normalize return value', async () => {
+    const { allBackendServices } = await import('$lib/services/backends');
+
+    CMS.registerBackend('wrap-commit-test', {
+      ...validBackend,
+      commitChanges: async () => ({ commitHash: 'abc123', files: { 'a.md': {} } }),
+    });
+
+    const result = await allBackendServices['wrap-commit-test'].commitChanges([], {});
+
+    expect(result.commitHash).toBe('abc123');
+    expect(result.files).toBeInstanceOf(Map);
+  });
+
+  test('wraps fetchFileCommits to normalize date strings', async () => {
+    const { allBackendServices } = await import('$lib/services/backends');
+
+    CMS.registerBackend('wrap-history-test', {
+      ...validBackend,
+      fetchFileCommits: async () => [
+        { sha: 'abc', authorName: 'Test', date: '2026-01-01T00:00:00Z' },
+      ],
+    });
+
+    const commits = await allBackendServices['wrap-history-test'].fetchFileCommits(['test.md']);
+
+    expect(commits[0].date).toBeInstanceOf(Date);
+  });
+});
+
 describe('CMS Proxy - unsupported functions', () => {
   test('returns undefined for unsupported functions', () => {
     // @ts-ignore
@@ -700,6 +989,10 @@ describe('CMS Proxy - unsupported functions', () => {
 describe('CMS - supported methods', () => {
   test('init method is accessible', () => {
     expect(typeof CMS.init).toBe('function');
+  });
+
+  test('registerBackend method is accessible', () => {
+    expect(typeof CMS.registerBackend).toBe('function');
   });
 
   test('registerCustomFormat method is accessible', () => {

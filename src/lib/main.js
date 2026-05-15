@@ -5,7 +5,12 @@ import createClass from 'create-react-class';
 import { createElement } from 'react';
 import { mount } from 'svelte';
 
+import { allBackendServices, validBackendNames } from '$lib/services/backends';
+import { getAssetKind } from '$lib/services/assets/kinds';
+import { createFileList } from '$lib/services/backends/process';
+import { updateStores } from '$lib/services/backends/git/shared/fetch';
 import { eventHookRegistry, SUPPORTED_EVENT_TYPES } from '$lib/services/contents/draft/events';
+import { prepareEntries } from '$lib/services/contents/file/process';
 import {
   customPreviewStyleRegistry,
   customPreviewTemplateRegistry,
@@ -54,7 +59,6 @@ const UNSUPPORTED_FUNC_NAMES = [
   'getWidgets',
   'invokeEvent',
   'moment', // Removed in Decap CMS 3.1.1 as it switched from Moment.js to Day.js
-  'registerBackend',
   'registerMediaLibrary',
   'registerWidgetValueSerializer',
   'removeEventListener',
@@ -283,9 +287,175 @@ const registerFieldType = (name, control, preview, schema) => {
   void [name, control, preview, schema];
 };
 
+/**
+ * Register a custom backend service. This allows integrating Sveltia CMS with any content storage
+ * provider (databases, custom APIs, cloud storage, etc.) without being limited to built-in Git
+ * backends.
+ *
+ * The `fetchFiles` method should return an array of file objects. Sveltia CMS will automatically
+ * process them (categorize entries and assets, parse content) and populate the internal stores.
+ * This means custom backends do not need access to any internal Sveltia CMS modules.
+ *
+ * Each file object should have: `{ path, name, sha, size, text? }` where `text` is the file
+ * content as a string (required for entry files like Markdown/YAML/JSON, optional for assets).
+ *
+ * @param {string} name Backend name. This should match the `backend.name` option in the CMS
+ * configuration. Must not conflict with built-in backend names.
+ * @param {object} backend Backend service implementation.
+ * @param {boolean} [backend.isGit] Whether the backend is a Git service. Default: `false`.
+ * @param {string} [backend.label] Human-readable label for the backend. Default: same as `name`.
+ * @param {() => any} backend.init Function to initialize the backend. Called when the backend is
+ * selected based on the configuration.
+ * @param {(options?: any) => Promise<any>} backend.signIn Function to sign in. Return a user
+ * object (e.g., `{ backendName: 'my-backend' }`) on success.
+ * @param {() => Promise<void>} backend.signOut Function to sign out.
+ * @param {() => Promise<Array<{ path: string, name: string, sha?: string, size?: number,
+ * text?: string }>>} backend.fetchFiles Function to fetch all files from the backend. Return an
+ * array of file objects. Entry files (Markdown, YAML, JSON) should include `text` content. Asset
+ * files (images, etc.) may omit `text`. Sveltia CMS handles all categorization and parsing.
+ * @param {(changes: Array<{ action: string, path: string, data?: string | Blob, base64?: string }>,
+ * options?: any) => Promise<{ commitHash?: string | null,
+ * files?: Map<string, object> | object }>} backend.commitChanges Function to save file changes
+ * (additions, updates, deletions). Return commit results with optional hash and file map.
+ * @param {(asset: { path: string }) => Promise<Blob>} [backend.fetchBlob] Function to fetch an
+ * asset as a Blob. Required if the backend serves binary files.
+ * @param {(paths: string[]) => Promise<Array<{ sha: string, authorName: string,
+ * authorEmail?: string, date: Date | string }>>} [backend.fetchFileCommits] Function to fetch
+ * commit history for the given file paths. Enables the revision history feature.
+ * @param {() => Promise<string>} [backend.checkStatus] Function to check the backend's
+ * operational status. Return `'none'`, `'minor'`, `'major'`, or `'unknown'`.
+ * @param {() => Promise<any>} [backend.triggerDeployment] Function to manually trigger a new
+ * deployment on the hosting provider.
+ * @throws {TypeError} If `name` is not a string or `backend` is not an object.
+ * @throws {TypeError} If any required method is missing or not a function.
+ * @throws {Error} If `name` conflicts with a built-in backend.
+ */
+const registerBackend = (name, backend) => {
+  if (typeof name !== 'string' || !name) {
+    throw new TypeError('The `name` option for `CMS.registerBackend()` must be a non-empty string');
+  }
+
+  if (!isObject(backend)) {
+    throw new TypeError('The `backend` option for `CMS.registerBackend()` must be an object');
+  }
+
+  // Prevent overriding built-in backends
+  if (validBackendNames.includes(/** @type {any} */ (name))) {
+    throw new Error(
+      `Cannot register backend "${name}": it conflicts with a built-in backend. ` +
+        'Choose a different name.',
+    );
+  }
+
+  // Validate required methods
+  const requiredMethods = ['init', 'signIn', 'signOut', 'fetchFiles', 'commitChanges'];
+
+  for (const method of requiredMethods) {
+    if (typeof backend[method] !== 'function') {
+      throw new TypeError(
+        `The backend must have a \`${method}\` function. ` +
+          'See the BackendService interface for required methods.',
+      );
+    }
+  }
+
+  // Validate optional methods if provided
+  const optionalMethods = [
+    'fetchBlob',
+    'fetchFileCommits',
+    'checkStatus',
+    'triggerDeployment',
+  ];
+
+  for (const method of optionalMethods) {
+    if (backend[method] !== undefined && typeof backend[method] !== 'function') {
+      throw new TypeError(
+        `The optional \`${method}\` property on the backend must be a function if provided.`,
+      );
+    }
+  }
+
+  // Wrap fetchFiles: the external backend returns raw file data,
+  // and we handle the internal store population automatically.
+  const originalFetchFiles = backend.fetchFiles;
+
+  const wrappedFetchFiles = async () => {
+    const files = await originalFetchFiles();
+
+    // If the backend returned void/undefined, it handled stores itself (advanced usage)
+    if (!Array.isArray(files)) {
+      return;
+    }
+
+    // Normalize file objects: ensure `name` is derived from `path` if missing
+    const normalizedFiles = files.map((file) => ({
+      ...file,
+      name: file.name || file.path.split('/').pop() || '',
+      sha: file.sha || '',
+      size: file.size || 0,
+    }));
+
+    const fileList = createFileList(normalizedFiles);
+    const { entryFiles, assetFiles } = fileList;
+
+    const { entries, errors } = await prepareEntries(entryFiles);
+
+    const assets = assetFiles.map((fileInfo) => {
+      const { name: fileName, ...rest } = fileInfo;
+
+      return { ...rest, name: fileName, kind: getAssetKind(fileName) };
+    });
+
+    updateStores({ entries, assets, configFiles: [], errors });
+  };
+
+  // Wrap fetchFileCommits: normalize date strings to Date objects
+  let wrappedFetchFileCommits;
+
+  if (backend.fetchFileCommits) {
+    const originalFetchFileCommits = backend.fetchFileCommits;
+
+    wrappedFetchFileCommits = async (paths) => {
+      const commits = await originalFetchFileCommits(paths);
+
+      return (commits ?? []).map((commit) => ({
+        ...commit,
+        date: commit.date instanceof Date ? commit.date : new Date(commit.date),
+      }));
+    };
+  }
+
+  // Wrap commitChanges: normalize the return value
+  const originalCommitChanges = backend.commitChanges;
+
+  const wrappedCommitChanges = async (changes, options) => {
+    const result = await originalCommitChanges(changes, options);
+
+    return {
+      commitHash: result?.commitHash ?? null,
+      files: result?.files instanceof Map ? result.files : new Map(Object.entries(result?.files ?? {})),
+    };
+  };
+
+  /** @type {import('$lib/types/private').BackendService} */
+  const service = {
+    isGit: false,
+    label: name,
+    ...backend,
+    name,
+    fetchFiles: wrappedFetchFiles,
+    commitChanges: wrappedCommitChanges,
+    ...(wrappedFetchFileCommits ? { fetchFileCommits: wrappedFetchFileCommits } : {}),
+  };
+
+  allBackendServices[name] = service;
+  validBackendNames.push(/** @type {any} */ (name));
+};
+
 const CMS = new Proxy(
   {
     init,
+    registerBackend,
     registerCustomFormat,
     registerEditorComponent,
     registerEventListener,
